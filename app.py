@@ -1,0 +1,441 @@
+"""
+Dashboard interactivo — Predicción de Riesgo Delictivo (Región La Libertad)
+Modelos: RandomForestClassifier (NIVEL_RIESGO) + RandomForestRegressor (TASA_DELITOS_10K)
+Motor: PySpark MLlib (los modelos se cargan con la persistencia nativa de Spark, no pickle/joblib)
+"""
+
+import os
+import sys
+import zipfile
+import pandas as pd
+import streamlit as st
+
+# ----------------------------------------------------------------------------------
+# FIX WINDOWS: asegura que el worker de PySpark use el MISMO intérprete de Python
+# que está corriendo Streamlit, y que Spark se enlace solo a localhost. Sin esto,
+# en Windows es común el error "Python worker failed to connect back" por el
+# Firewall o por que Spark intenta lanzar un python distinto/inexistente.
+# ----------------------------------------------------------------------------------
+os.environ["PYSPARK_PYTHON"] = sys.executable
+os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
+
+# ----------------------------------------------------------------------------------
+# CONFIGURACIÓN GENERAL DE LA PÁGINA
+# ----------------------------------------------------------------------------------
+st.set_page_config(
+    page_title="Riesgo Delictivo — La Libertad",
+    page_icon="🚓",
+    layout="wide",
+)
+
+RUTA_MODELOS = "modelos_entrenados"
+RUTA_ZIP = "modelos_entrenados.zip"
+RUTA_CSV = "historico_dashboard.csv"
+
+MESES_NOMBRE = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril", 5: "Mayo", 6: "Junio",
+    7: "Julio", 8: "Agosto", 9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre",
+}
+
+COLOR_RIESGO = {"BAJO": "#2ecc71", "MEDIO": "#f39c12", "ALTO": "#e74c3c"}
+
+RECOMENDACION_RIESGO = {
+    "BAJO": "Mantener el patrullaje preventivo habitual y continuar el monitoreo rutinario del distrito.",
+    "MEDIO": "Reforzar la vigilancia, aumentar la frecuencia de patrullajes y monitorear de cerca la evolución del distrito.",
+    "ALTO": "Incrementar el patrullaje preventivo, reforzar los operativos policiales y priorizar recursos en el distrito.",
+}
+
+NIVEL_CONFIANZA = {
+    0: ("Alta", "#2ecc71", "Calculado 100% con datos reales registrados."),
+    1: ("Media", "#f39c12", "Usa 1 valor propio proyectado en el paso anterior (LAG_1)."),
+    2: ("Baja", "#e74c3c", "Usa 2 o más valores proyectados encadenados; la incertidumbre se acumula."),
+}
+
+
+# ----------------------------------------------------------------------------------
+# CARGA DE RECURSOS (cacheados para no recargar en cada interacción)
+# ----------------------------------------------------------------------------------
+@st.cache_resource(show_spinner="Iniciando motor Spark y cargando modelos entrenados…")
+def cargar_spark_y_modelos():
+    """Descomprime (si hace falta) y carga el pipeline + los dos modelos finales."""
+    if not os.path.isdir(RUTA_MODELOS):
+        if os.path.exists(RUTA_ZIP):
+            with zipfile.ZipFile(RUTA_ZIP, "r") as z:
+                z.extractall(RUTA_MODELOS)
+        else:
+            st.error(
+                f"No se encontró la carpeta '{RUTA_MODELOS}' ni el archivo '{RUTA_ZIP}'. "
+                "Sube el ZIP de modelos exportado desde tu notebook de Colab (celda de exportación) "
+                "junto a este app.py."
+            )
+            st.stop()
+
+    from pyspark.sql import SparkSession
+    from pyspark.ml import PipelineModel
+    from pyspark.ml.feature import StringIndexerModel
+    from pyspark.ml.classification import RandomForestClassificationModel
+    from pyspark.ml.regression import RandomForestRegressionModel
+
+    spark = (
+        SparkSession.builder
+        .appName("DashboardDelitosLaLibertad")
+        .master("local[*]")
+        .config("spark.sql.shuffle.partitions", "4")
+        .config("spark.driver.memory", "2g")
+        .config("spark.ui.showConsoleProgress", "false")
+        .config("spark.driver.host", "127.0.0.1")
+        .config("spark.driver.bindAddress", "127.0.0.1")
+        .config("spark.python.worker.reuse", "true")
+        .getOrCreate()
+    )
+    spark.sparkContext.setLogLevel("ERROR")
+
+    feature_pipeline_model = PipelineModel.load(f"{RUTA_MODELOS}/feature_pipeline_model")
+    label_indexer_model = StringIndexerModel.load(f"{RUTA_MODELOS}/label_indexer_model")
+    modelo_clf = RandomForestClassificationModel.load(f"{RUTA_MODELOS}/randomforest_clasificacion")
+    modelo_reg = RandomForestRegressionModel.load(f"{RUTA_MODELOS}/randomforest_regresion")
+
+    etiquetas_riesgo = label_indexer_model.labels  # índice -> "BAJO"/"MEDIO"/"ALTO"
+    return spark, feature_pipeline_model, modelo_clf, modelo_reg, etiquetas_riesgo
+
+
+@st.cache_data(show_spinner="Cargando dataset histórico…")
+def cargar_historico() -> pd.DataFrame:
+    if not os.path.exists(RUTA_CSV):
+        st.error(
+            f"No se encontró '{RUTA_CSV}'. Genera y sube este archivo con la celda de exportación "
+            "que agregaste a tu Colab (ver celda_exportar_csv_colab.py)."
+        )
+        st.stop()
+    return pd.read_csv(RUTA_CSV)
+
+
+# ----------------------------------------------------------------------------------
+# LÓGICA DE PREDICCIÓN (usa el pipeline + modelos de Spark ya entrenados)
+# ----------------------------------------------------------------------------------
+def ejecutar_prediccion(_spark, _pipeline, _modelo_clf, _modelo_reg, etiquetas_riesgo, fila_features: dict):
+    """
+    fila_features debe traer EXACTAMENTE:
+    POBLACION, DENSIDAD_POB, LAG_1, LAG_3, PROMEDIO_MOVIL_3M, VAR_INTERANUAL,
+    DISTRITO (texto), TIPO_DELITO (texto)
+    El pipeline se encarga de indexar DISTRITO/TIPO_DELITO y ensamblar el vector "features".
+    """
+    columnas_modelo = [
+        "POBLACION", "DENSIDAD_POB", "LAG_1", "LAG_3",
+        "PROMEDIO_MOVIL_3M", "VAR_INTERANUAL", "DISTRITO", "TIPO_DELITO",
+    ]
+    fila_limpia = {k: fila_features[k] for k in columnas_modelo}
+
+    spark_df = _spark.createDataFrame([fila_limpia])
+    transformado = _pipeline.transform(spark_df)
+
+    pred_clf_row = _modelo_clf.transform(transformado).select("prediction").collect()[0]
+    pred_reg_row = _modelo_reg.transform(transformado).select("prediction").collect()[0]
+
+    idx_riesgo = int(pred_clf_row["prediction"])
+    nivel_riesgo = etiquetas_riesgo[idx_riesgo] if idx_riesgo < len(etiquetas_riesgo) else "DESCONOCIDO"
+    tasa_predicha = float(pred_reg_row["prediction"])
+    return nivel_riesgo, tasa_predicha
+
+
+def calcular_features_mes_siguiente(hist: pd.DataFrame, distrito: str, tipo_delito: str):
+    """Replica _proyectar_mes_siguiente del notebook: construye el vector del mes
+    inmediato siguiente al último registrado, usando solo datos reales."""
+    sub = hist[(hist.DISTRITO == distrito) & (hist.TIPO_DELITO == tipo_delito)].sort_values(["ANIO", "MES"])
+    if sub.empty:
+        return None
+
+    ultimo = sub.iloc[-1]
+    anio_ref, mes_ref = int(ultimo["ANIO"]), int(ultimo["MES"])
+    mes_obj, anio_obj = mes_ref + 1, anio_ref
+    if mes_obj > 12:
+        mes_obj, anio_obj = 1, anio_obj + 1
+
+    def cantidad_en(a, m):
+        f = sub[(sub.ANIO == a) & (sub.MES == m)]
+        return float(f.iloc[0]["CANTIDAD_DELITOS"]) if not f.empty else None
+
+    lag_1 = cantidad_en(anio_ref, mes_ref)
+
+    m3, a3 = mes_obj - 3, anio_obj
+    while m3 <= 0:
+        m3 += 12
+        a3 -= 1
+    lag_3 = cantidad_en(a3, m3)
+
+    valores = []
+    for k in range(1, 4):
+        mk, ak = mes_obj - k, anio_obj
+        while mk <= 0:
+            mk += 12
+            ak -= 1
+        v = cantidad_en(ak, mk)
+        if v is not None:
+            valores.append(v)
+    promedio_movil = sum(valores) / len(valores) if valores else None
+
+    if lag_1 is None or lag_3 is None or promedio_movil is None:
+        return None
+
+    return {
+        "ANIO": anio_obj, "MES": mes_obj,
+        "PROVINCIA": ultimo["PROVINCIA"],
+        "POBLACION": float(ultimo["POBLACION"]),
+        "DENSIDAD_POB": float(ultimo["DENSIDAD_POB"]),
+        "LAG_1": lag_1, "LAG_3": lag_3,
+        "PROMEDIO_MOVIL_3M": promedio_movil,
+        "VAR_INTERANUAL": float(ultimo["VAR_INTERANUAL"]),
+        "DISTRITO": distrito, "TIPO_DELITO": tipo_delito,
+        "n_proyectados_en_ventana": 0,
+    }
+
+
+def proyectar_horizonte(hist: pd.DataFrame, distrito: str, tipo_delito: str, n_meses: int = 3):
+    """Replica _proyectar_horizonte del notebook: encadena hasta n_meses de proyección,
+    usando cada resultado propio como insumo del siguiente mes. Retorna lista de dicts."""
+    sub = hist[(hist.DISTRITO == distrito) & (hist.TIPO_DELITO == tipo_delito)].sort_values(["ANIO", "MES"])
+    if sub.empty:
+        return []
+
+    historial = {(int(r.ANIO), int(r.MES)): float(r.CANTIDAD_DELITOS) for r in sub.itertuples()}
+    meses_reales = set(historial.keys())
+
+    ultimo = sub.iloc[-1]
+    anio_actual, mes_actual = int(ultimo["ANIO"]), int(ultimo["MES"])
+    var_interanual_base = float(ultimo["VAR_INTERANUAL"])
+    provincia = ultimo["PROVINCIA"]
+    poblacion = float(ultimo["POBLACION"])
+    densidad = float(ultimo["DENSIDAD_POB"])
+
+    resultados = []
+
+    for paso in range(1, n_meses + 1):
+        mes_obj, anio_obj = mes_actual + 1, anio_actual
+        if mes_obj > 12:
+            mes_obj, anio_obj = 1, anio_obj + 1
+
+        lag_1 = historial.get((anio_actual, mes_actual))
+
+        m3, a3 = mes_obj - 3, anio_obj
+        while m3 <= 0:
+            m3 += 12
+            a3 -= 1
+        lag_3 = historial.get((a3, m3))
+
+        ventana, n_proyectados_ventana = [], 0
+        for k in range(1, 4):
+            mk, ak = mes_obj - k, anio_obj
+            while mk <= 0:
+                mk += 12
+                ak -= 1
+            v = historial.get((ak, mk))
+            if v is not None:
+                ventana.append(v)
+                if (ak, mk) not in meses_reales:
+                    n_proyectados_ventana += 1
+        promedio_movil = sum(ventana) / len(ventana) if ventana else None
+
+        if lag_1 is None or lag_3 is None or promedio_movil is None:
+            break
+
+        resultados.append({
+            "ANIO": anio_obj, "MES": mes_obj, "PROVINCIA": provincia,
+            "POBLACION": poblacion, "DENSIDAD_POB": densidad,
+            "LAG_1": lag_1, "LAG_3": lag_3,
+            "PROMEDIO_MOVIL_3M": promedio_movil,
+            "VAR_INTERANUAL": var_interanual_base,
+            "DISTRITO": distrito, "TIPO_DELITO": tipo_delito,
+            "n_proyectados_en_ventana": min(n_proyectados_ventana, 2),
+            "paso": paso,
+        })
+
+        # Encadenar: el resultado de este paso pasa a formar parte del "historial"
+        # usando el promedio móvil como proxy de CANTIDAD_DELITOS del mes proyectado.
+        historial[(anio_obj, mes_obj)] = promedio_movil
+        anio_actual, mes_actual = anio_obj, mes_obj
+
+    return resultados
+
+
+# ----------------------------------------------------------------------------------
+# COMPONENTES VISUALES REUTILIZABLES
+# ----------------------------------------------------------------------------------
+def mostrar_resultado(nivel_riesgo: str, tasa_predicha: float, poblacion: float, contexto: str = ""):
+    color = COLOR_RIESGO.get(nivel_riesgo, "#7f8c8d")
+    delitos_estimados = round(tasa_predicha * poblacion / 10_000)
+
+    st.markdown(
+        f"""
+        <div style="padding:1.2rem;border-radius:12px;background-color:{color}22;
+                    border:2px solid {color};margin-bottom:0.8rem;">
+            <span style="font-size:1.1rem;font-weight:600;color:{color};">
+                NIVEL DE RIESGO: {nivel_riesgo}
+            </span><br>
+            <span style="color:#444;">{contexto}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Nivel de riesgo", nivel_riesgo)
+    c2.metric("Tasa estimada (por 10,000 hab.)", f"{tasa_predicha:.2f}")
+    c3.metric("Delitos estimados", f"{delitos_estimados:,}")
+
+    st.info(f"**Recomendación operativa:** {RECOMENDACION_RIESGO.get(nivel_riesgo, 'Sin recomendación disponible.')}")
+
+
+# ----------------------------------------------------------------------------------
+# APP PRINCIPAL
+# ----------------------------------------------------------------------------------
+def main():
+    st.title("🚓 Predicción de Riesgo Delictivo — Región La Libertad")
+    st.caption(
+        "Basado en RandomForestClassifier (nivel de riesgo) y RandomForestRegressor "
+        "(tasa de delitos por 10,000 hab.) entrenados con PySpark MLlib sobre datos "
+        "históricos de la PNP (2022–2026)."
+    )
+
+    spark, pipeline, modelo_clf, modelo_reg, etiquetas_riesgo = cargar_spark_y_modelos()
+    hist = cargar_historico()
+
+    tab_predecir, tab_proyectar = st.tabs(["📊 Predecir (dato histórico)", "🔮 Proyectar (meses futuros)"])
+
+    # ============================== TAB 1: PREDECIR ==============================
+    with tab_predecir:
+        st.subheader("Consultar la predicción del modelo sobre un periodo ya registrado")
+        st.caption(
+            "Selecciona Provincia → Distrito → Tipo de delito → Año → Mes. El sistema recupera "
+            "las variables reales de ese registro y ejecuta ambos modelos."
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            provincia_sel = st.selectbox("Provincia", sorted(hist["PROVINCIA"].unique()))
+        distritos_disp = sorted(hist.loc[hist.PROVINCIA == provincia_sel, "DISTRITO"].unique())
+        with col2:
+            distrito_sel = st.selectbox("Distrito", distritos_disp)
+        tipos_disp = sorted(
+            hist.loc[(hist.PROVINCIA == provincia_sel) & (hist.DISTRITO == distrito_sel), "TIPO_DELITO"].unique()
+        )
+        with col3:
+            tipo_sel = st.selectbox("Tipo de delito", tipos_disp)
+
+        base_filtrada = hist[
+            (hist.PROVINCIA == provincia_sel) & (hist.DISTRITO == distrito_sel) & (hist.TIPO_DELITO == tipo_sel)
+        ]
+        col4, col5 = st.columns(2)
+        with col4:
+            anio_sel = st.selectbox("Año", sorted(base_filtrada["ANIO"].unique(), reverse=True))
+        meses_disp = sorted(base_filtrada.loc[base_filtrada.ANIO == anio_sel, "MES"].unique())
+        with col5:
+            mes_sel = st.selectbox("Mes", meses_disp, format_func=lambda m: MESES_NOMBRE.get(m, m))
+
+        if st.button("🔍 Predecir", type="primary", use_container_width=True):
+            fila = base_filtrada[(base_filtrada.ANIO == anio_sel) & (base_filtrada.MES == mes_sel)]
+            if fila.empty:
+                st.warning("No se encontró un registro exacto para esa combinación.")
+            else:
+                fila = fila.iloc[0]
+                nivel_riesgo, tasa_predicha = ejecutar_prediccion(
+                    spark, pipeline, modelo_clf, modelo_reg, etiquetas_riesgo, fila.to_dict()
+                )
+
+                st.markdown("### Resultado de la predicción")
+                mostrar_resultado(
+                    nivel_riesgo, tasa_predicha, fila["POBLACION"],
+                    contexto=f"{distrito_sel} — {tipo_sel} — {MESES_NOMBRE.get(mes_sel)} {anio_sel}",
+                )
+
+                st.markdown("### Comparación con el valor real registrado")
+                cc1, cc2 = st.columns(2)
+                cc1.metric("Nivel de riesgo REAL", fila["NIVEL_RIESGO"])
+                cc2.metric(
+                    "Tasa REAL (por 10,000 hab.)", f"{fila['TASA_DELITOS_10K']:.2f}",
+                    delta=f"{tasa_predicha - fila['TASA_DELITOS_10K']:+.2f} vs. predicho",
+                )
+
+                with st.expander("Ver variables utilizadas por el modelo"):
+                    st.dataframe(
+                        fila[[
+                            "POBLACION", "DENSIDAD_POB", "LAG_1", "LAG_3",
+                            "PROMEDIO_MOVIL_3M", "VAR_INTERANUAL", "DISTRITO", "TIPO_DELITO",
+                        ]].to_frame().T,
+                        use_container_width=True,
+                    )
+
+    # ============================== TAB 2: PROYECTAR ==============================
+    with tab_proyectar:
+        st.subheader("Pronosticar meses que aún no han sido registrados")
+        st.caption(
+            "A diferencia de la pestaña anterior, aquí se proyecta el mes inmediato siguiente "
+            "al último dato disponible de un distrito y tipo de delito (útil para anticipar riesgo "
+            "antes de que ocurra)."
+        )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            distrito_p = st.selectbox("Distrito", sorted(hist["DISTRITO"].unique()), key="distrito_p")
+        tipos_p = sorted(hist.loc[hist.DISTRITO == distrito_p, "TIPO_DELITO"].unique())
+        with col2:
+            tipo_p = st.selectbox("Tipo de delito", tipos_p, key="tipo_p")
+        with col3:
+            n_meses = st.slider("Meses a proyectar", min_value=1, max_value=3, value=1)
+
+        if st.button("🔮 Proyectar", type="primary", use_container_width=True):
+            if n_meses == 1:
+                features_mes = calcular_features_mes_siguiente(hist, distrito_p, tipo_p)
+                if features_mes is None:
+                    st.warning(
+                        "No hay historia suficiente (se requieren al menos 3 meses previos) "
+                        "para proyectar este distrito/tipo de delito."
+                    )
+                else:
+                    nivel_riesgo, tasa_predicha = ejecutar_prediccion(
+                        spark, pipeline, modelo_clf, modelo_reg, etiquetas_riesgo, features_mes
+                    )
+                    st.markdown(
+                        f"### Proyección para {MESES_NOMBRE.get(features_mes['MES'])} {features_mes['ANIO']}"
+                    )
+                    mostrar_resultado(
+                        nivel_riesgo, tasa_predicha, features_mes["POBLACION"],
+                        contexto=f"{distrito_p} — {tipo_p} — Confianza: Alta (dato inmediato siguiente)",
+                    )
+            else:
+                pasos = proyectar_horizonte(hist, distrito_p, tipo_p, n_meses=n_meses)
+                if not pasos:
+                    st.warning(
+                        "No hay historia suficiente (se requieren al menos 3 meses previos) "
+                        "para proyectar este distrito/tipo de delito."
+                    )
+                else:
+                    st.markdown(f"### Proyección a {len(pasos)} mes(es) — {distrito_p} / {tipo_p}")
+                    st.caption(
+                        "La confianza baja en cada paso porque los meses proyectados usan "
+                        "resultados propios de pasos anteriores como si fueran datos reales."
+                    )
+                    for paso in pasos:
+                        nivel_riesgo, tasa_predicha = ejecutar_prediccion(
+                            spark, pipeline, modelo_clf, modelo_reg, etiquetas_riesgo, paso
+                        )
+                        etiqueta_conf, color_conf, detalle_conf = NIVEL_CONFIANZA[paso["n_proyectados_en_ventana"]]
+
+                        st.markdown(f"**{MESES_NOMBRE.get(paso['MES'])} {paso['ANIO']}**")
+                        mostrar_resultado(
+                            nivel_riesgo, tasa_predicha, paso["POBLACION"],
+                            contexto=(
+                                f"Confianza: <span style='color:{color_conf};font-weight:600;'>"
+                                f"{etiqueta_conf}</span> — {detalle_conf}"
+                            ),
+                        )
+                        st.divider()
+
+    st.markdown("---")
+    st.caption(
+        "⚠️ Herramienta de apoyo a la toma de decisiones. Las predicciones deben complementarse "
+        "siempre con el criterio operativo de la PNP."
+    )
+
+
+if __name__ == "__main__":
+    main()
