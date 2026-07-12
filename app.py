@@ -295,6 +295,10 @@ def proyectar_horizonte(spark, pipeline, modelo_clf, modelo_reg, etiquetas_riesg
             "nivel_riesgo": nivel_riesgo, "tasa_predicha": tasa_predicha,
             "delitos_estimados": delitos_estimados,
             "etiqueta_conf": etiqueta_conf, "color_conf": color_conf, "detalle_conf": detalle_conf,
+            "features_usadas": {
+                "LAG_1": lag_1, "LAG_3": lag_3, "PROMEDIO_MOVIL_3M": promedio_movil,
+                "VAR_INTERANUAL": var_interanual_base,
+            },
         })
 
         # Igual que en el notebook: el resultado PREDICHO por el modelo (no un promedio)
@@ -565,6 +569,8 @@ def main():
                                 f"{paso['etiqueta_conf']}</span> — {paso['detalle_conf']}"
                             ),
                         )
+                        with st.expander("Ver variables de entrada usadas este mes (para verificar si cambian)"):
+                            st.json(paso["features_usadas"])
                         st.divider()
 
     st.markdown("---")
