@@ -85,13 +85,16 @@ def cargar_spark_y_modelos():
     spark = (
         SparkSession.builder
         .appName("DashboardDelitosLaLibertad")
-        .master("local[*]")
-        .config("spark.sql.shuffle.partitions", "4")
-        .config("spark.driver.memory", "2g")
+        .master("local[2]")
+        .config("spark.sql.shuffle.partitions", "2")
+        .config("spark.driver.memory", "900m")
+        .config("spark.executor.memory", "900m")
+        .config("spark.ui.enabled", "false")
         .config("spark.ui.showConsoleProgress", "false")
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.python.worker.reuse", "true")
+        .config("spark.sql.execution.arrow.pyspark.enabled", "false")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("ERROR")
@@ -463,7 +466,7 @@ def main():
         with col5:
             mes_sel = st.selectbox("Mes", meses_disp, format_func=lambda m: MESES_NOMBRE.get(m, m), key="mes_pred")
 
-        if st.button("🔍 Predecir", type="primary", use_container_width=True):
+        if st.button("🔍 Predecir", type="primary", width="stretch"):
             fila = base_filtrada[(base_filtrada.ANIO == anio_sel) & (base_filtrada.MES == mes_sel)]
             if fila.empty:
                 st.warning("No se encontró un registro exacto para esa combinación.")
@@ -497,7 +500,7 @@ def main():
                             "POBLACION", "DENSIDAD_POB", "LAG_1", "LAG_3",
                             "PROMEDIO_MOVIL_3M", "VAR_INTERANUAL", "DISTRITO", "TIPO_DELITO",
                         ]].to_frame().T,
-                        use_container_width=True,
+                        width="stretch",
                     )
 
     # ============================== TAB 2: PROYECTAR ==============================
@@ -520,7 +523,7 @@ def main():
         with col4:
             n_meses = st.slider("Meses a proyectar", min_value=1, max_value=3, value=1)
 
-        if st.button("🔮 Proyectar", type="primary", use_container_width=True):
+        if st.button("🔮 Proyectar", type="primary", width="stretch"):
             spark, pipeline, modelo_clf, modelo_reg, etiquetas_riesgo = cargar_spark_y_modelos()
 
             if n_meses == 1:
